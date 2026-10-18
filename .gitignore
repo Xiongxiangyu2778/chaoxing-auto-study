@@ -1,0 +1,31 @@
+# 本地私有配置（含 API Key，绝不入库）
+llm_config.json
+
+# 运行时产物
+题目.txt
+题目_*.txt
+答案模板.json
+答案.json
+答案.md
+answers.json
+解析.json
+ai_raw.txt
+作业信息.json
+考试单元.json
+考试模式.json
+考试填答结果.json
+听力工作单.json
+听力*.mp3
+*.mp3
+quiz_filled.png
+作业截图.png
+考试填答完成.png
+听力填完.png
+考试页现状.png
+
+# 系统/依赖
+node_modules/
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc

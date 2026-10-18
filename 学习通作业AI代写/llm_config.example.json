@@ -1,0 +1,8 @@
+{
+  "base_url": "https://open.bigmodel.cn/api/paas/v4",
+  "models": ["glm-5.3-flash", "glm-5.3-flashx", "glm-4.5-flash"],
+  "model": "glm-5.3-flash",
+  "api_key": "",
+  "temperature": 0.2,
+  "timeout": 180
+}
