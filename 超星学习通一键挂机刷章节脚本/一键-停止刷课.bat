@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 title Stop Auto Course Script (browser kept)
 echo.
 echo Stopping the auto-course script ...
