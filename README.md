@@ -139,3 +139,13 @@ AI 配置：复制 `llm_config.example.json` 为 `llm_config.json`，填 `api_ke
 
 本项目仅供学习交流与自动化技术研究，使用产生的一切后果由使用者自行承担。
 请遵守所在学校/平台的相关规定，合理使用。
+
+---
+
+## 🧩 本站其他工具
+
+| 项目 | 说明 |
+|---|---|
+| [douyin-spark-keeper](https://github.com/Xiongxiangyu2778/douyin-spark-keeper) | 抖音续火花自动续期：自动识别有火花的好友，每天定时发送话术，不用逐个手输 |
+
+> 两个项目都是「早八自动化」系列，同一套思路：把重复的事交给代码。
