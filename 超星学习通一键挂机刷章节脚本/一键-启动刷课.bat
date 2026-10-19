@@ -9,9 +9,11 @@ set "NODE_PATH=%WORKDIR%node_modules"
 rem ── 自动寻找 Node.js：① 系统 PATH ② WorkBuddy 自带（开发者机器）──
 set "NODE="
 for /f "delims=" %%i in ('where node 2^>nul') do if not defined NODE set "NODE=%%i"
-if not defined NODE if exist "%USERPROFILE%\.workbuddy\binaries\node\versions\22.22.2-6\node.exe" set "NODE=%USERPROFILE%\.workbuddy\binaries\node\versions\22.22.2-6\node.exe"
+if defined NODE goto HAVE_NODE
+if exist "%USERPROFILE%\.workbuddy\binaries\node\versions\22.22.2-6\node.exe" set "NODE=%USERPROFILE%\.workbuddy\binaries\node\versions\22.22.2-6\node.exe"
 if defined NODE goto HAVE_NODE
 
+:NO_NODE
 echo.
 echo   [X] 没有找到 Node.js —— 这是脚本的运行环境。
 echo   请先双击「一键-安装环境.bat」，按提示装好后再运行本文件。
@@ -20,6 +22,9 @@ pause
 exit /b 1
 
 :HAVE_NODE
+rem 依赖检查：没装 playwright-core 就直接提示，别让它静默失败
+if not exist "%WORKDIR%node_modules\playwright-core" goto NO_DEP
+
 set "EDGE=C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
 if not exist "%EDGE%" set "EDGE=C:\Program Files\Microsoft\Edge\Application\msedge.exe"
 set "PROFILE=%USERPROFILE%\edge-quiz-profile"
@@ -27,6 +32,7 @@ set "PROFILE=%USERPROFILE%\edge-quiz-profile"
 echo ============================================================
 echo      Xue Xi Tong  -  Auto Course Runner  (v5)
 echo ============================================================
+echo   Node : %NODE%
 echo.
 echo [1/4] Checking standalone Edge (debug port 9222) ...
 
@@ -55,12 +61,11 @@ timeout /t 12 >nul
 
 echo.
 echo [4/4] Status
-powershell -NoProfile -Command "$n = @(Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Where-Object { $_.CommandLine -like '*chaoxing_course*' }).Count; $e = @(Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | Where-Object { $_.CommandLine -like '*edge-quiz-profile*' } | Measure-Object).Count; Write-Host ('   script process : ' + $n); Write-Host ('   edge  process  : ' + $e); if ($n -gt 0) { Write-Host '   STATUS: RUNNING - safe to leave it working.' } else { Write-Host '   STATUS: NOT RUNNING - 如果反复出现请把本窗口截图发给作者' }"
+powershell -NoProfile -Command "$n = @(Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Where-Object { $_.CommandLine -like '*chaoxing_course*' }).Count; $e = @(Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | Where-Object { $_.CommandLine -like '*edge-quiz-profile*' } | Measure-Object).Count; Write-Host ('   script process : ' + $n); Write-Host ('   edge  process  : ' + $e); if ($n -gt 0) { Write-Host '   STATUS: RUNNING - safe to leave it working.' } else { Write-Host '   STATUS: NOT RUNNING - check the log file.' }"
 
 echo.
 echo ------------------------------------------------------------
 echo   HOW TO USE
-echo    0. 第一次使用先双击「一键-安装环境.bat」（只需一次）
 echo    1. Edge 打开后，进你的课程，随便点开一个章节。
 echo    2. 之后全自动。
 echo    3. 可以最小化窗口，但别关它。
@@ -73,3 +78,12 @@ echo   Homework   : 上一级目录，打开 写作业 文件夹
 echo ------------------------------------------------------------
 echo.
 pause
+exit /b 0
+
+:NO_DEP
+echo.
+echo   [X] 缺少依赖 playwright-core（node_modules 里没找到）。
+echo   请先双击「一键-安装环境.bat」自动安装，然后再运行本文件。
+echo.
+pause
+exit /b 1
