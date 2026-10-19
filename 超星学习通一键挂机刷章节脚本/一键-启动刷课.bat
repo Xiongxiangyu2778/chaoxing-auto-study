@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 title Xue Xi Tong Auto Course - Standalone Mode
 cd /d "%~dp0"
 
@@ -55,11 +56,11 @@ echo    1. Edge opens. Go to your course, click any section.
 echo    2. Everything after that is automatic.
 echo    3. You may minimize. Close the window only yourself.
 echo.
-echo   Speed       : Ñ¡Ôñ±¶ËÙ.bat
-echo   Pause       : Ò»¼ü-ÔİÍ£Ë¢¿Î.bat
-echo   Resume      : Ò»¼ü-¼ÌĞøË¢¿Î.bat
-echo   Stop script : Ò»¼ü-Í£Ö¹Ë¢¿Î.bat  (browser stays open)
-echo   Homework    : go up one level, open Ğ´×÷Òµ folder
+echo   Speed       : é€‰æ‹©å€é€Ÿ.bat
+echo   Pause       : ä¸€é”®-æš‚åœåˆ·è¯¾.bat
+echo   Resume      : ä¸€é”®-ç»§ç»­åˆ·è¯¾.bat
+echo   Stop script : ä¸€é”®-åœæ­¢åˆ·è¯¾.bat  (browser stays open)
+echo   Homework    : go up one level, open å†™ä½œä¸š folder
 echo ------------------------------------------------------------
 echo.
 pause
