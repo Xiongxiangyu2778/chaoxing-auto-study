@@ -1,8 +1,9 @@
 @echo off
+chcp 65001 >nul
 title Auto Course - PAUSE
 cd /d "%~dp0"
-"%USERPROFILE%\.workbuddy\binaries\python\envs\default\Scripts\python.exe" -c "import json,io; p='Ë¢¿ÎÅäÖÃ.json'; c=json.load(io.open(p,encoding='utf-8')); c['paused']=True; json.dump(c, io.open(p,'w',encoding='utf-8'), ensure_ascii=False, indent=2)"
+"%USERPROFILE%\.workbuddy\binaries\python\envs\default\Scripts\python.exe" -c "import json,io; p='åˆ·è¯¾é…ç½®.json'; c=json.load(io.open(p,encoding='utf-8')); c['paused']=True; json.dump(c, io.open(p,'w',encoding='utf-8'), ensure_ascii=False, indent=2)"
 echo.
-echo   [PAUSED] ½Å±¾ÒÑÍ£Ö¹²Ù×÷Ò³Ãæ£¬ÄãÏÖÔÚ¿ÉÒÔ×Ô¼º²¹×÷Òµ¡£²¹ÍêË«»÷¡¸Ò»¼ü-¼ÌĞøË¢¿Î.bat¡¹¡£
+echo   [PAUSED] è„šæœ¬å·²åœæ­¢æ“ä½œé¡µé¢ï¼Œä½ ç°åœ¨å¯ä»¥è‡ªå·±è¡¥ä½œä¸šã€‚è¡¥å®ŒåŒå‡»ã€Œä¸€é”®-ç»§ç»­åˆ·è¯¾.batã€ã€‚
 echo.
 pause
