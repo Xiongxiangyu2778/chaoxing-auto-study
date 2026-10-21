@@ -3,6 +3,22 @@
    用法：双击「一键-自动刷课.bat」→ 自动打开独立 Edge → 自己登录/进课程一次，
         之后全自动（可最小化窗口挂后台）。
 
+   ═══ v7.16（2026-10-21）★★★ 修复 issue#「反复暂停+反复关残留弹窗+最小化反复弹出」★★★ ═══
+   用户实测症状：每 5s 循环「暂停中→点击+续播」+「已关闭一个残留弹窗（取消/关闭）：暂停 播放速度 倍速…」，
+                倍速不生效、最小化时窗口反复弹到前台。
+   真凶（三处）：
+        ① v7.10b 弹窗兜底 dismissStrayPopups 的 overlay 条件（absolute+有按钮+尺寸合适）把
+          【视频播放器控制条】也当成了弹窗 —— o.text 打出来就是整条控制栏文本（实锤）。
+        ② 关闭按钮正则 /取消|关闭|…/ 为包含匹配 →「取消静音」命中「取消」→ 每轮点击控制条
+          → 打断播放 → 触发暂停续播 → 恶性循环。
+        ③ 视频一暂停就 page.bringToFront() → 每轮都弹 → 最小化反复跳出。
+   修复：
+        ① overlay 内含 video/audio/控制条 一律排除；
+        ② 关闭按钮文本收紧：≤6 字 + 排除 播放器控件词（静音/播放/暂停/倍速/设置/音量/进度/速度）；
+        ③ bringToFront 加 90s 节流。
+   注：「加载完毕: 0% 进度: 0%」「倍速」值为播放器 UI 显示（部分课程播放器恒为 0/悬停才显示），
+       不影响任务点记账（记账走 aria-label 权威判据）。
+
    ═══ v7.15（2026-10-17 凌晨）★★★ "刷不动"的总根源已找到并修复 ★★★ ═══
    症状：手动把页面放到前面章节，4 秒后又被弹回 5.2；全课程刷不动；bug 巨多。
    真凶：killPopups 里 `locator('text=确定').first().click()` —— Playwright 的 text= 是【子串匹配】！
@@ -940,6 +956,7 @@ function dumpUnknown(list) {
   //         #popok 确认提交只有"带取消按钮"时才点取消，纯确认交回 handleQuiz 处理。
   //   看门狗：同一弹窗文本持续 >90s 关不掉 → 打印文本 + 截图，精确定位"到底是什么弹窗没处理"。
   const popupWatch = new Map();   // text -> { first, logged }
+  let lastFrontAt = 0;            // v7.16：bringToFront 节流（issue：最小化时窗口反复弹出）
   async function dismissStrayPopups(f, page) {
     try {
       const found = await f.evaluate(() => {
@@ -947,6 +964,11 @@ function dumpUnknown(list) {
         const overlays = [...document.querySelectorAll('div,section')].filter(d => {
           // ⚠ v7.15：目录容器不是弹窗！它的行内有 onclick=跳章 → 一律排除（曾把"确定"匹配到目录行）
           if (d.closest('#mainCatalog, .posCatalogBox, .zkCatalog, #catalog, .posCatalog_select, [id^="cur"]')) return false;
+          // ⚠ v7.16（JBraokuan issue）：视频播放器控制条（含「暂停/取消静音/设置」按钮）不是弹窗！
+          //    旧版把控制条当弹窗 → 每轮点「取消静音」（正则包含匹配"取消"）→ 打断播放 →
+          //    「暂停中→续播」+「已关闭残留弹窗」每 5s 死循环（issue 实锤）。
+          //    凡是内含 video/audio 元素或播放器控制条的容器，一律不是弹窗。
+          if (d.querySelector('video, audio, .vjs-control-bar, .prism-control-bar, .vjs-tech')) return false;
           const s = getComputedStyle(d);
           if (s.position !== 'fixed' && s.position !== 'absolute') return false;
           const r = d.getBoundingClientRect();
@@ -960,7 +982,13 @@ function dumpUnknown(list) {
           const t = (ov.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 120);
           const btns = [...ov.querySelectorAll('a,button,[role=button],.layui-layer-btn0')].filter(el => vis(el));
           // 安全关闭按钮（排除 #popok 本身，避免误交坏成绩）
-          const cancel = btns.find(b => /取消|关闭|暂不|稍后|✕|×|X|知道了|好的|确定/i.test((b.innerText || '').trim()) && b.id !== 'popok');
+          // ⚠ v7.16：按钮文本收紧 —— 必须 ≤6 字 + 不能是播放器控件词（取消静音/播放/暂停/倍速/设置…）
+          const cancel = btns.find(b => {
+            const t = (b.innerText || '').trim();
+            if (!t || t.length > 6 || b.id === 'popok') return false;
+            if (/静音|播放|暂停|倍速|设置|音量|进度|速度/.test(t)) return false;
+            return /^(取消|关闭|暂不|稍后|知道了|好的|确定|✕|×|X)/.test(t);
+          });
           let acted = false;
           if (cancel) { try { cancel.click(); acted = true; } catch (e) {} }
           res.push({ text: t, acted });
@@ -2422,7 +2450,11 @@ function dumpUnknown(list) {
             `${i + 1}${x.ended ? '✓' : (x.done === true ? '✔' : (x === active ? '▶' : '·'))} ${fmt(x.cur)}/${fmt(x.dur)}`).join('   '));
         }
 
-        if (active.paused && !active.ended) await page.bringToFront().catch(() => {});
+        // ⚠ v7.16：节流 —— 暂停时最多每 90s 弹回前台一次（旧版每轮都弹，最小化时窗口反复跳出）
+        if (active.paused && !active.ended) {
+          const nowF = Date.now();
+          if (nowF - lastFrontAt > 90000) { lastFrontAt = nowF; await page.bringToFront().catch(() => {}); }
+        }
         // ③ 非 active 的视频：凡是在播的显式暂停（保证"同时只有一个在播"；它们本来也会被学习通暂停）
         for (const o of vids) {
           if (o === active || o.ended || o.paused) continue;
