@@ -1,7 +1,7 @@
 /* 通用：按 answers.json 填答当前超星作业（带逐题验证），填完点暂时保存
    answers.json 格式：
    {
-     "single": ["B","B",...],        // 单选按题号顺序
+     "single": ["B","B",...],        // 单选按题号顺序（阅读理解/完形的子题也平铺在这里）
      "judge":  ["A","B",...],        // 判断 A=对 B=错
      "blank":  ["语义", ...],         // 填空按题号顺序
      "essay":  ["答案文本", ...]      // 简答+计算按题号顺序
@@ -91,6 +91,10 @@ const log = m => console.log(new Date().toISOString().slice(11,19), m);
   await page.waitForTimeout(5000);
 
   const stat = { single: 0, judge: 0, blank: 0, essay: 0, errs: [] };
+  // v7.2（2026-10-22）：队列式消费 —— 阅读理解子题平铺进 single 数组后，
+  //     题号与 DOM 不再一一对应；统一按 DOM 顺序消费队列。
+  //     dump 的 题目.txt 就是用同一个 DOM 顺序生成的，两边天然对齐。
+  let curSingle = 0;
   const blocks = await page.$$('div.questionLi');
 
   for (const q of blocks) {
@@ -98,29 +102,36 @@ const log = m => console.log(new Date().toISOString().slice(11,19), m);
     const numTxt = (await q.$eval('h3.mark_name', h => h.innerText).catch(()=> '')) || '';
     const num = parseInt((numTxt.match(/\d+/) || ['0'])[0]);
     try {
-      if (type === '单选题') {
-        const want = ANS.single[num-1];
-        if (!want) continue;
+      if (type === '单选题' || type === '多选题') {
+        // v7.2：队列取答案（含阅读理解子题）；多选题连点字母
+        const want = ANS.single[curSingle];
+        if (want === undefined) continue;
+        curSingle++;
+        if (!String(want).trim()) { stat.errs.push(`单选${num}:答案为空`); continue; }
+        const multi = type === '多选题';
+        const letters = String(want).toUpperCase().replace(/[^A-H]/g, '').split('');
         const qid = (await q.getAttribute('id')).replace('question','');
         for (let a = 1; a <= 3; a++) {
           let cur = await q.$eval(`#answer${qid}`, el => el.value).catch(()=> '');
-          if (cur === want) { stat.single++; break; }
+          const got = String(cur || '').toUpperCase().replace(/[^A-H]/g, '');
+          if (multi ? (got && got.split('').sort().join('') === letters.slice().sort().join('')) : got === String(want).trim().toUpperCase()) { stat.single++; break; }
           const opts = await q.$$('div.answerBg');
           let hit = null;
           for (const o of opts) {
             const sp = await o.$('span[data]');
             const d = sp ? await sp.getAttribute('data') : '';
-            const t = sp ? (await sp.innerText()).trim() : '';
-            if (d === want || t === want) { hit = o; break; }
+            if (letters.includes(d)) { hit = o; break; }
           }
           if (!hit) break;
           await hit.click(); await sleep(500);
           cur = await q.$eval(`#answer${qid}`, el => el.value).catch(()=> '');
-          if (cur === want) { stat.single++; break; }
-          if (cur === '') await q.$eval(`#answer${qid}`, (el, v) => { el.value = v; }, want);
+          const got2 = String(cur || '').toUpperCase().replace(/[^A-H]/g, '');
+          if (multi ? (got2 && got2.split('').sort().join('') === letters.slice().sort().join('')) : got2 === String(want).trim().toUpperCase()) { stat.single++; break; }
+          if (!got2) await q.$eval(`#answer${qid}`, (el, v) => { el.value = v; }, letters.join(''));
         }
-        const fin = await q.$eval(`#answer${qid}`, el => el.value).catch(()=> '');
-        if (fin !== want) stat.errs.push(`单选${num}`);
+        const fin = String(await q.$eval(`#answer${qid}`, el => el.value).catch(()=> '') || '').toUpperCase().replace(/[^A-H]/g, '');
+        const okFin = multi ? fin.split('').sort().join('') === letters.slice().sort().join('') : fin === String(want).trim().toUpperCase();
+        if (!okFin && fin !== '') stat.errs.push(`单选${num}`);
       }
       else if (type === '判断题') {
         const want = ANS.judge[stat.judge];
@@ -134,6 +145,28 @@ const log = m => console.log(new Date().toISOString().slice(11,19), m);
           if (d === want || t === want || (want === 'A' && d === 'true') || (want === 'B' && d === 'false')) { hit = o; break; }
         }
         if (hit) { await hit.click(); await sleep(400); stat.judge++; } else stat.errs.push(`判断${num}`);
+      }
+      else if (type === '阅读理解' || type === '完形填空') {
+        // v7.2（2026-10-22）：大题带 .reading_answer 子题，每子题是独立单选 ——
+        //    旧版整个跳过（题型名不认识）→「做一半」。按 DOM 顺序消费 single 队列。
+        const subs = await q.$$('.reading_answer');
+        let done = 0;
+        for (const ra of subs) {
+          const spans = await ra.$$('span[data]');
+          if (!spans.length) continue;               // 纯说明块，不占答案
+          const want = ANS.single[curSingle];
+          if (want === undefined || !String(want).trim()) { curSingle++; continue; }
+          curSingle++;
+          const letter = String(want).trim().toUpperCase().replace(/[^A-H]/g, '').charAt(0);
+          let hit = null;
+          for (const s of spans) {
+            if ((await s.getAttribute('data')) === letter) { hit = s; break; }
+          }
+          if (hit) { await hit.click(); await sleep(350); done++; }
+          else stat.errs.push(`阅读${num}-${done + 1}:无选项${letter}`);
+        }
+        if (done) stat.single += done;
+        else stat.errs.push(`阅读${num}:0子题命中`);
       }
       else if (type === '填空题') {
         const ifr = await q.$$('.edui-editor-iframeholder iframe');
@@ -178,7 +211,9 @@ const log = m => console.log(new Date().toISOString().slice(11,19), m);
         }
         if (!filled) stat.errs.push(`听力${num}`);
       }
-      else if (type === '简答题' || type === '计算题') {
+      else if (type === '简答题' || type === '计算题' || type === '翻译题'
+            || type === '论述题' || type === '名词解释' || type === '写作题' || type === '问答题') {
+        // v7.2：补上 翻译/论述/名词解释/写作 —— 旧版只认 简答/计算，翻译题整块漏掉
         const val = ANS.essay[stat.essay];
         if (val === undefined) continue;
         const ifr = await q.$$('.edui-editor-iframeholder iframe');
@@ -207,7 +242,7 @@ const log = m => console.log(new Date().toISOString().slice(11,19), m);
     } catch (e) { stat.errs.push(`${type}${num}: ` + e.message.slice(0,30)); }
   }
 
-  log(`结果: 单选${stat.single} 判断${stat.judge} 填空${stat.blank} 问答${stat.essay} 附件${stat.attach || 0}` + (stat.errs.length ? ' | 异常: ' + stat.errs.join(',') : ' | 全部成功'));
+  log(`结果: 单选${stat.single}(含阅读子题) 判断${stat.judge} 填空${stat.blank} 问答${stat.essay} 附件${stat.attach || 0}` + (stat.errs.length ? ' | 异常: ' + stat.errs.join(',') : ' | 全部成功'));
   await page.evaluate(() => { try { for (const k in window.$EDITORUI) { const e = window.$EDITORUI[k]; if (e && e.sync) e.sync(); } } catch (e) {} });
   try {
     await page.click('text=暂时保存', { timeout: 15000 });

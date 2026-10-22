@@ -1,5 +1,16 @@
 /* 通用：导出当前超星作业页的所有题目文本 → 题目.txt
-   用法：先手动打开作业作答页（dowork），再运行本脚本 */
+   用法：先手动打开作业作答页（dowork），再运行本脚本
+
+   ═══ v6.2（2026-10-22）★★ 考试页「无效参数」根因修复 ★★ ═══
+   症状：所有题目抓完之后，页面立刻跳成「无效参数」，作答会话废掉。
+   根因：旧版 total = 答题卡数 + 1，最后一轮对不存在的「第 N+1 题」越界调用
+        getTheQuestionByStart(题数, '0')（答题卡下标是 0 基，50 题上限是 49）
+        → 学习通前端直接跳错误页。
+   修法：① 读每张答题卡 li 的 onclick，解析出真实下标，只调用实际存在的题号；
+        ② 切题后检测 URL 跳出 / 题目 12 秒不渲染 → 立刻停手，已抓部分照常落盘；
+        ③ 残卷保护：本次抓到的比上次已导出的少 → 不覆盖旧文件；
+        ④ 收尾体检：抓完若发现页面已失效，明确提示「题目已存好，填答前需重新进考试」。
+*/
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -52,13 +63,30 @@ const log = m => console.log(new Date().toISOString().slice(11,19), m);
   const WAIT_MS = Math.max(0, Number(process.env.CHX_WAIT_SECONDS ?? 600)) * 1000;
   // 作答页识别（v2）：不再死认 dowork —— 学习通有些作业页是 doHomeWorkNew / work/... 格式。
   // 规则：优先 URL 像作答页；否则看哪个页面里**真的有题目块** div.questionLi。
-  const ANSWER_URL = /(dowork|doHomeWork|work\/doWork|work\/answer)/i;
+  // v6（2026-10-22）：把「考试作答页」也纳入 URL 直认。
+  // 旧版只认作业页 URL，考试页靠 DOM 兜底探测；但 Edge 的休眠标签页会让 $$eval 永不返回，
+  // 导致轮询死等（实测：考试已经开始 90 秒脚本还在「等待你打开作答页」）。
+  // 注意 exam-ans/exam/test（列表页）不带 reVersionTest，不会被误认。
+  const ANSWER_URL = /(dowork|doHomeWork|work\/doWork|work\/answer|reVersionTest)/i;
+  // DOM 探测加超时：单页最多 3s，挂起的标签页直接跳过
+  const probeQ = (p) => Promise.race([
+    p.$$eval('div.questionLi', els => els.length).catch(() => 0),
+    sleep(3000).then(() => 0),
+  ]);
   async function findAnswerPage() {
     const pages = ctx.pages();
-    const byUrl = pages.find(p => ANSWER_URL.test(p.url()));
-    if (byUrl) return byUrl;
+    // v6.2：URL 命中还不够 —— 必须页面上真有题目块或答题卡，才认定为作答页。
+    // （考试列表页/空壳页可能也带 reVersionTest 字样，误认后遍历会全部抓空）
+    const hasCards = (p) => Promise.race([
+      p.$$eval('li[onclick*="getTheQuestionByStart"]', els => els.length).catch(() => 0),
+      sleep(3000).then(() => 0),
+    ]);
+    for (const p of pages.filter(x => ANSWER_URL.test(x.url()))) {
+      if (await probeQ(p) > 0) return p;
+      if (await hasCards(p) > 0) return p;
+    }
     for (const p of pages) {
-      const n = await p.$$eval('div.questionLi', els => els.length).catch(() => 0);
+      const n = await probeQ(p);
       if (n > 0) return p;
     }
     return null;
@@ -80,26 +108,72 @@ const log = m => console.log(new Date().toISOString().slice(11,19), m);
   // 策略：逐题切换 → 每屏抽取「可答单元」（大题的子题平铺为独立条目）→ 汇总。
   if (/exam-ans|reVersionTest/i.test(target.url())) {
     log('检测到考试页 → 逐题遍历模式');
-    const total = await target.evaluate(() => {
-      const lis = [...document.querySelectorAll('li')].filter(e =>
-        /^\d{1,2}$/.test((e.innerText || '').trim()) &&
-        (e.getAttribute('onclick') || '').includes('getTheQuestionByStart'));
-      return lis.length + 1;
-    });
-    log(`共 ${total} 题开始逐题抓取…`);
+    // ═══ v6.2（2026-10-22）★★ 考试页「无效参数」的真凶：越界切题 ★★ ═══
+    // 现场观察：页面失效（显示「无效参数」）恰好发生在【所有题目抓完之后】。
+    // 原因：旧版 total = 答题卡数 + 1（50 题 → total=51），最后一轮 idx=50 调用
+    //       getTheQuestionByStart(50, '0')，而答题卡下标是 0 基（第 50 题 = 49），
+    //       传 50 = 越界 → 学习通前端直接跳错误页，把整场考试的作答会话搞死。
+    // 修法：不再用 idx 从 0 累加去猜下标，直接读每张答题卡 li 的 onclick，
+    //       解析出学习通自己传的真实下标 → 有 50 张卡就只调用这 50 个下标，绝不越界。
+    let cardIdx = [];
+    for (let k = 0; k < 5; k++) {
+      cardIdx = await target.evaluate(() => {
+        const lis = [...document.querySelectorAll('li')].filter(e =>
+          /^\d{1,2}$/.test((e.innerText || '').trim()) &&
+          (e.getAttribute('onclick') || '').includes('getTheQuestionByStart'));
+        return lis.map(e => {
+          const oc = e.getAttribute('onclick') || '';
+          const m = oc.match(/getTheQuestionByStart\(\s*['"]?(\d+)['"]?/);
+          if (m) return Number(m[1]);
+          // 兜底：onclick 里没写死数字时，用卡面题号（1 基）换算成 0 基
+          const n = parseInt((e.innerText || '').trim(), 10);
+          return Number.isFinite(n) ? n - 1 : null;
+        }).filter(v => v !== null && Number.isFinite(v));
+      }).catch(() => []);
+      if (cardIdx.length) break;
+      log('  答题卡未渲染完，1.5s 后重试…');
+      await sleep(1500);
+    }
+    cardIdx = [...new Set(cardIdx)].sort((a, b) => a - b);   // 去重 + 升序（防重复卡/多套卡）
+    const total = cardIdx.length;
+    log(total
+      ? `共 ${total} 题（答题卡下标 ${cardIdx[0]}~${cardIdx[total - 1]}）开始逐题抓取…`
+      : '✗ 没读到任何答题卡，无法遍历');
     const units = [];
     const seen = new Set();
-    for (let idx = 0; idx < total; idx++) {
+    let partial = false;      // true = 中途页面失效，抓到的是残卷
+    for (let n = 0; n < cardIdx.length; n++) {
+      const idx = cardIdx[n];
       await target.evaluate(i => getTheQuestionByStart(i, '0'), idx).catch(() => {});
-      // 等当前题渲染稳定（题干文本连续两次一致）
-      let sig = '', stable = 0;
+      // 等当前题渲染稳定（题干文本连续两次一致）；同时每轮检查 URL，
+      // 一旦发现已经离开作答页（跳错误页/交卷页）立刻断开，不必白等满 12 秒
+      let sig = '', stable = 0, urlLost = '';
       for (let w = 0; w < 15; w++) {
         await sleep(800);
         const s = await target.evaluate(() => {
           const el = document.querySelector('div.questionLi');
-          return el ? (el.innerText || '').replace(/\s+/g, ' ').slice(0, 120) : '';
-        });
-        if (s && s === sig) { if (++stable >= 2) break; } else { stable = 0; sig = s; }
+          return {
+            t: el ? (el.innerText || '').replace(/\s+/g, ' ').slice(0, 120) : '',
+            url: location.href,
+          };
+        }).catch(() => ({ t: '', url: '' }));
+        if (s.url && !/exam-ans|reVersionTest/i.test(s.url)) { urlLost = s.url; break; }
+        if (s.t && s.t === sig) { if (++stable >= 2) break; } else { stable = 0; sig = s.t; }
+      }
+      // 🛡 v6.2：切题后「页面还活着吗」——URL 跑出作答页，或题干等了 12 秒仍是空，
+      // 都说明已经不在作答状态（会话被踢 / 跳了错误页）。此时必须立刻停手：
+      // 已抓到的照常落盘，绝不继续切题把整场考试搞废
+      if (urlLost || !sig) {
+        const st = await target.evaluate(() => ({
+          url: location.href,
+          head: (document.body ? document.body.innerText : '').replace(/\s+/g, ' ').slice(0, 100),
+        })).catch(() => ({ url: urlLost || '?', head: '?' }));
+        log(`⚠ 第 ${n + 1}/${total} 题切不过去（${urlLost ? '页面已跳出作答页' : '题目长期不渲染'}）`);
+        log(`   当前 URL：${st.url}`);
+        log(`   页面文字：${st.head || '(空)'}`);
+        log(`   已抓 ${units.length} 题 → 立即停止抓取，保留已抓部分`);
+        partial = true;
+        break;
       }
       const got = await target.evaluate(() => {
         const el = document.querySelector('div.questionLi');
@@ -143,7 +217,30 @@ const log = m => console.log(new Date().toISOString().slice(11,19), m);
         seen.add(key);
         units.push(u);
       }
-      log(`  [${idx + 1}/${total}] 抓到 ${got.length} 个可答单元（累计 ${units.length}）`);
+      log(`  [${n + 1}/${total}] 抓到 ${got.length} 个可答单元（累计 ${units.length}）`);
+    }
+    // 🛡 v6（2026-10-22）：抓 0 题时**不覆盖**已有文件，避免一次竞态把导出的题目清成空文件
+    if (!units.length) {
+      log('✗ 没抓到任何题目（页面可能正在切换/渲染）→ 保留原有 题目.txt / 答案模板.json 不覆盖');
+      log('  建议：在浏览器里点一下答题卡第 1 题，等题目显示出来再重跑');
+      await browser.close();
+      process.exit(3);
+    }
+    // 🛡 v6.2：残卷保护 —— 中途页面失效只抓到一部分时，若比上次已导出的还少，
+    // 绝不覆盖旧文件（上次就被一次竞态把完整的 50 题冲成了 1 题）
+    let prevCount = 0;
+    try {
+      const pf = __dirname + '/考试单元.json';
+      if (fs.existsSync(pf)) prevCount = ((JSON.parse(fs.readFileSync(pf, 'utf-8')).units) || []).length;
+    } catch (e) {}
+    if (partial && units.length < prevCount) {
+      log(`✗ 本次只抓到 ${units.length} 题（上次已导出 ${prevCount} 题更完整）→ 保留旧文件，不覆盖`);
+      log('  建议：重新进入考试作答页后重跑；已有题目可直接用 --skip-dump 继续答题');
+      await browser.close();
+      process.exit(5);
+    }
+    if (partial) {
+      log(`⚠ 本次是残卷：${units.length} 题 / 答题卡 ${total} 题，已按残卷落盘（下游会提示题数不符）`);
     }
     // 写题目.txt：平铺编号，标注考试原题号；听力题在题干里带上音频标记
     let out = '';
@@ -167,12 +264,15 @@ const log = m => console.log(new Date().toISOString().slice(11,19), m);
     fs.writeFileSync(__dirname + '/答案模板.json', JSON.stringify(tmpl, null, 2), 'utf-8');
     // 🧩 考试单元元数据（供通用填答脚本按题型分派：点选项 / 写编辑器）
     fs.writeFileSync(__dirname + '/考试单元.json', JSON.stringify({
-      total, units: units.map(u => ({
+      total: units.length, cardCount: total, partial,
+      units: units.map(u => ({
         examNum: u.examNum, sub: u.sub, type: u.type,
         text: u.text, options: u.options, audioOids: u.audioOids
       }))
     }, null, 2), 'utf-8');
-    fs.writeFileSync(__dirname + '/考试模式.json', JSON.stringify({ total, units: units.length }, null, 2), 'utf-8');
+    fs.writeFileSync(__dirname + '/考试模式.json', JSON.stringify({
+      total: units.length, cardCount: total, partial
+    }, null, 2), 'utf-8');
     log(`✓ 考试导出完成：${units.length} 个可答单元 → 题目.txt + 考试单元.json + 答案模板.json`
         + `（单选${tmpl.single.length}/判断${tmpl.judge.length}/填空${tmpl.blank.length}/简答${tmpl.essay.length}）`);
     // 截图 + 课程信息照常
@@ -183,10 +283,23 @@ const log = m => console.log(new Date().toISOString().slice(11,19), m);
     try {
       const meta = await target.evaluate(() => ({
         title: (document.title || '').trim(), url: location.href,
+        // v7（2026-10-22）：dowork 页 DOM 里常常没有课程名元素（标题只有"作业作答"），
+        // 但 URL 里一定带 courseId —— 把它记下来，chx.py 用「courseId→课程名」缓存做判定
+        courseId: (location.href.match(/[?&]courseId=(\d+)/) || [])[1] || null,
+        classId: (location.href.match(/[?&]classId=(\d+)/) || [])[1] || null,
         candidates: [(document.querySelector('.mark_title, h1, .tit')?.innerText || document.title || '').replace(/\s+/g, ' ').slice(0, 40)],
       }));
       meta.savedAt = new Date().toISOString();
       fs.writeFileSync(__dirname + '/作业信息.json', JSON.stringify(meta, null, 2), 'utf-8');
+    } catch (e) {}
+    // 🛡 v6.2：收尾体检 —— 抓完只读 URL、绝不切题。若这时页面已经坏了，
+    // 立刻明确告诉用户「题目已存好，但要重新进考试才能填答」，别让人纳闷。
+    try {
+      const endUrl = await target.evaluate(() => location.href).catch(() => '');
+      if (endUrl && !/exam-ans|reVersionTest/i.test(endUrl)) {
+        log(`⚠ 抓取结束时页面已离开作答页：${endUrl.slice(0, 100)}`);
+        log('  题目已完整存好，但填答前需要你重新进入考试（验证码人工过）');
+      }
     } catch (e) {}
     log('下一步：AI 答题 → 考试模式填答（fill 会自动走同一套遍历）');
     await browser.close();
@@ -198,12 +311,37 @@ const log = m => console.log(new Date().toISOString().slice(11,19), m);
   let items = [];
   let prevCount = -1, stable = 0;
   for (let i = 0; i < 60; i++) {
-    items = await target.$$eval('div.questionLi', els => els.map(el => ({
-      num: (el.querySelector('h3')?.innerText || '').trim().split('.')[0],
-      type: el.getAttribute('typename'),
-      text: (el.querySelector('h3')?.innerText || '').replace(/\s+/g, ' ').trim(),
-      options: [...el.querySelectorAll('div.answerBg span[data]')].map(s => s.getAttribute('data') + ' ' + (s.parentElement.innerText || '').replace(/\s+/g, ' ').trim())
-    })));
+    items = await target.$$eval('div.questionLi', els => els.map(el => {
+      // 🛠 v7.1（2026-10-22）：阅读理解等大题的子题在 .reading_answer 里 —— 旧版只抓 h3，
+      //    子题（含 4~5 道单选小题）整块漏掉 → AI 没得答 → 填答也跳过 → 「做一半」。
+      //    现在把每个子题平铺成独立条目；长材料（阅读文章）拼进第一个子题，供 AI 上下文。
+      const subs = [...el.querySelectorAll('.reading_answer')]
+        .map(ra => ({
+          hasOpts: ra.querySelectorAll('span[data]').length > 0,
+          text: (ra.innerText || '').replace(/\s+/g, ' ').trim(),
+          options: [...ra.querySelectorAll('div.answerBg span[data], span[data]')].map(s =>
+            s.getAttribute('data') + ' ' + (s.parentElement.innerText || '').replace(/\s+/g, ' ').trim())
+            .filter((v, i, a) => a.indexOf(v) === i),
+        }))
+        .filter(s => s.hasOpts || s.text.length > 15);
+      const stem = (el.querySelector('h3')?.innerText || '').replace(/\s+/g, ' ').trim();
+      const base = {
+        type: el.getAttribute('typename'),
+        stem,
+        options: [...el.querySelectorAll('div.answerBg span[data]')].map(s =>
+          s.getAttribute('data') + ' ' + (s.parentElement.innerText || '').replace(/\s+/g, ' ').trim()),
+      };
+      if (/阅读/.test(base.type || '') && subs.some(s => s.hasOpts)) {
+        // 大题带可作答子题：材料拼给第一个子题，子题逐个平铺
+        // ⚠ 只平铺带选项的子题 —— 无选项的说明块不占答案坑，否则与 fill 的队列错位
+        return subs.filter(s => s.hasOpts).map((s, k) => ({
+          type: '单选题',
+          text: (k === 0 ? '【阅读理解材料】' + stem + ' ' : '') + s.text,
+          options: s.options,
+        }));
+      }
+      return [{ num: '', type: base.type, text: stem, options: base.options }];
+    }).flat());
     if (items.length > 0 && items.length === prevCount) { stable++; if (stable >= 2) break; }
     else stable = 0;
     prevCount = items.length;
@@ -212,15 +350,15 @@ const log = m => console.log(new Date().toISOString().slice(11,19), m);
   }
   if (!items.length) log('⚠ 等了 60s 仍未见题目（可能不是作答页）→ 按空卷继续');
   let out = '';
-  for (const it of items) {
-    // 去掉 h3 里自带的「1.」「(简答题)」前缀，避免和外面的编号重复
+  items.forEach((it, n) => {
+    // v7.1：编号由导出顺序统一生成（子题平铺后天然连续）；去掉 h3 里自带的「1.」「(单选题)」前缀
     const body = String(it.text || '')
       .replace(/^\s*\d+\s*[.、]\s*/, '')
       .replace(/^[（(][^）)]{0,8}[）)]\s*/, '');
-    out += `${it.num}. (${it.type}) ${body}\n`;
-    for (const o of it.options) out += '   ' + o + '\n';
+    out += `${n + 1}. (${it.type}) ${body}\n`;
+    for (const o of (it.options || [])) out += '   ' + o + '\n';
     out += '\n';
-  }
+  });
   fs.writeFileSync(__dirname + '/题目.txt', out, 'utf-8');
 
   // 📸 截图（2026-10-13 新增）：学习通题干有字体反爬 → innerText 可能是乱码，
@@ -268,6 +406,9 @@ const log = m => console.log(new Date().toISOString().slice(11,19), m);
       }
       return {
         title: (document.title || '').trim(),
+        // v7：同上 —— URL 的 courseId 是课程唯一标识，进缓存用
+        courseId: (location.href.match(/[?&]courseId=(\d+)/) || [])[1] || null,
+        classId: (location.href.match(/[?&]classId=(\d+)/) || [])[1] || null,
         candidates: texts.slice(0, 12),
         url: location.href,
       };

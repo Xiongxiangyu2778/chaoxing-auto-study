@@ -8,6 +8,12 @@
  *   - 单选题/多选题/阅读理解 → 点 span[data=A/B/C/D]（多选连点多个字母）
  *   - 判断题               → 同上，A=正确 B=错误（自动翻译对/错/true/false）
  *   - 填空题/简答题/计算题   → 写入 UEditor iframe（富文本编辑器）
+ *
+ * v6.2（2026-10-22）：
+ *   ① 选中复核不再靠猜 class（旧版 50 题全部「无选中标记」= 等于没复核），
+ *      改为点击前后对选项 DOM 做 diff，真正变了样的选项才是被选中的；
+ *   ② 页面失效探针：答题卡和题目块一起消失 → 立刻停手，保留已填结果，
+ *      不再每题白等 20 秒、最后报一堆「找不到第N题」；
  * 任何课程、任何科目的考试页都可以直接用，只要题目能从页面上抓到。
  *
  * 用法:
@@ -81,13 +87,42 @@ async function main() {
   for (const arr of byQ.values()) arr.sort((a, b) => (a.sub || 0) - (b.sub || 0));
 
   const browser = await pw.chromium.connectOverCDP('http://127.0.0.1:' + PORT);
-  const page = browser.contexts()[0].pages().find(p => /exam-ans|reVersionTest/i.test(p.url()));
-  if (!page) { log('✗ 没找到考试作答页（请先进入考试，验证码需人工过）'); process.exit(2); }
+  const allPages = browser.contexts()[0].pages();
+  // v6.2（2026-10-22）：精确挑「作答页」。
+  // 旧写法 /exam-ans|reVersionTest/ 会命中考试列表页（exam-ans/exam/test）和「无效参数」页
+  // （reVersionTestStartNew?keyboardDisplayRequiresUserAction=1），导致在错误页面上空转。
+  const page = allPages.find(p => /reVersionTestStartNew/i.test(p.url()) && !/keyboardDisplayRequiresUserAction/i.test(p.url()))
+    || allPages.find(p => /reVersionTest/i.test(p.url()) && !/\/look/i.test(p.url()));
+  if (!page) {
+    log('✗ 没找到考试作答页（请先进入考试，验证码需人工过）');
+    log('  当前标签页：' + (allPages.map(p => p.url().slice(0, 70)).join('  |  ') || '无'));
+    process.exit(2);
+  }
+  log('作答页：' + page.url().slice(0, 90));
+
+  // v6.2：全量记录 dialog / 导航 / JS 异常 —— 页面一旦变「无效参数」，日志里能立刻看出是谁触发的
+  page.on('dialog', async d => {
+    log(`[dialog] ${d.type()}: ${String(d.message()).replace(/\s+/g, ' ').slice(0, 90)} → dismiss（脚本绝不替用户确认）`);
+    try { await d.dismiss(); } catch (e) {}
+  });
+  page.on('framenavigated', f => { if (f === page.mainFrame()) log(`[nav] → ${page.url().slice(0, 100)}`); });
+  page.on('pageerror', e => log(`[jserr] ${String((e && e.message) || e).slice(0, 100)}`));
 
   const stat = { filled: 0, skipped: [], errs: [], byType: {} };
   const cursor = { single: 0, judge: 0, blank: 0, essay: 0 };
 
+  // v6.2：页面失效探针 —— 作答会话被踢 / 页面跳错误页时，答题卡和题目块会一起消失。
+  // 旧版会继续跑完剩下的题：每题白等 20 秒，最后报一堆「找不到第N题」，还可能把
+  // 已填好的答案当成失败。现在发现失效就立刻停手，保留已填结果。
+  const pageAlive = () => page.evaluate(() => ({
+    cards: document.querySelectorAll('li[onclick*="getTheQuestionByStart"]').length,
+    q: !!document.querySelector('div.questionLi'),
+    url: location.href,
+  })).catch(() => ({ cards: 0, q: false, url: '?' }));
+  let lostPage = false;
+
   for (const [examNum, qUnits] of byQ) {
+    if (lostPage) break;
     // 切到该题
     const okNav = await page.evaluate(n => {
       const li = [...document.querySelectorAll('li')].find(e =>
@@ -96,10 +131,18 @@ async function main() {
       if (!li) return false;
       li.click(); return true;
     }, examNum).catch(() => false);
-    if (!okNav) { log('✗ 答题卡上找不到第' + examNum + '题，跳过'); stat.skipped.push(examNum); continue; }
+    if (!okNav) {
+      const a = await pageAlive();
+      if (!a.cards && !a.q) {
+        log(`✗ 答题卡与题目块同时消失（页面已失效：${a.url.slice(0, 80)}）`);
+        log(`  → 立即停止，已填 ${stat.filled} 题、失败 ${stat.errs.length} 题`);
+        lostPage = true; break;
+      }
+      log('✗ 答题卡上找不到第' + examNum + '题，跳过'); stat.skipped.push(examNum); continue;
+    }
 
     // 等渲染（题干出现 + 有可答元素）
-    let ready = false;
+    let ready = false, deadRounds = 0;
     for (let i = 0; i < 20; i++) {
       await sleep(1000);
       ready = await page.evaluate(() => {
@@ -108,7 +151,15 @@ async function main() {
         return !!q.querySelector('span[data], .edui-editor-iframeholder iframe, textarea');
       }).catch(() => false);
       if (ready) break;
+      // 连续 3 秒连题目块/答题卡都没有 → 判定页面已死，不必耗满 20 秒
+      const a = await pageAlive();
+      if (!a.q && !a.cards && ++deadRounds >= 3) {
+        log(`✗ 第${examNum}题等待中页面失效（${a.url.slice(0, 80)}）→ 立即停止`);
+        log(`  → 已填 ${stat.filled} 题、失败 ${stat.errs.length} 题`);
+        lostPage = true; break;
+      }
     }
+    if (lostPage) break;
     if (!ready) { log('第' + examNum + '题无可答元素（等待超时），跳过'); stat.skipped.push(examNum); continue; }
 
     for (const u of qUnits) {
@@ -129,35 +180,74 @@ async function main() {
 
       if (!isText) {
         // ── 选择题 / 判断题：点 span[data=字母]，多选连点 ──
+        // v6.1（2026-10-22）：判断题的选项 data 是 true/false（不是 A/B），
+        // 从单元的 options（形如 "true A 对"）构建 字母→data 映射；再兜底按文本（对/错）匹配。
         const letters = normOption(raw, type).replace(/[^A-H]/g, '') || normOption(raw, type);
-        const filled = await page.evaluate(({ sub, letters }) => {
+        // v6.2：点击前给每个选项拍快照（自身 outerHTML + 父节点 class），
+        // 点击后再拍一次，diff 出「哪些选项的样式真的变了」= 真正被选中的。
+        // 旧版靠 className 正则猜选中态，学习通根本不是这套 class → 50 题全部
+        // 显示「页面无选中标记，以点击为准」，等于没有复核。
+        const snapOpts = (sub) => page.evaluate(({ sub }) => {
+          const q = document.querySelector('div.questionLi');
+          const groups = q.querySelectorAll('.reading_answer');
+          const scope = groups.length && sub > 0 ? groups[sub - 1] : q;
+          const m = {};
+          [...scope.querySelectorAll('span[data]')].forEach((s, i) => {
+            const k = (s.getAttribute('data') || '?') + '#' + i;
+            m[k] = (s.outerHTML || '') + '||' + ((s.parentElement && s.parentElement.className) || '');
+          });
+          return m;
+        }, { sub }).catch(() => ({}));
+
+        const before = await snapOpts(sub);
+        const filled = await page.evaluate(({ sub, letters, opts }) => {
           const q = document.querySelector('div.questionLi');
           const groups = q.querySelectorAll('.reading_answer');
           const scope = groups.length && sub > 0 ? groups[sub - 1] : q;
           const spans = [...scope.querySelectorAll('span[data]')];
+          const map = {};
+          for (const o of (opts || [])) {
+            const m = String(o).trim().match(/^(\S+)\s+([A-H])\b/);
+            if (m) map[m[2]] = m[1];
+          }
           const done = [];
           for (const ch of letters) {
-            const t = spans.find(s => s.getAttribute('data') === ch);
+            let t = spans.find(s => s.getAttribute('data') === ch);
+            if (!t && map[ch]) t = spans.find(s => s.getAttribute('data') === map[ch]);
+            if (!t) {
+              const re = ch === 'A' ? /对|正确|√/ : /错|错误|×/;
+              t = spans.find(s => re.test(s.parentElement?.innerText || s.innerText || ''));
+            }
             if (t) { t.click(); done.push(ch); }
           }
           return done.join('');
-        }, { sub, letters });
+        }, { sub, letters, opts: u.options || [] });
         await sleep(600);
-        // 复核选中状态
-        const got = await page.evaluate(({ sub }) => {
-          const q = document.querySelector('div.questionLi');
-          const groups = q.querySelectorAll('.reading_answer');
-          const scope = groups.length && sub > 0 ? groups[sub - 1] : q;
-          const hits = [...scope.querySelectorAll('span[data]')]
-            .filter(s => /check_answer|check|active|select/i.test(s.className))
-            .map(s => s.getAttribute('data'));
-          return hits.join('');
-        }, { sub }).catch(() => '');
+        // 复核：diff 出真正变样的选项（不依赖任何猜测的 class 名）
+        const after = await snapOpts(sub);
+        const changed = [...new Set(Object.keys(after)
+          .filter(k => before[k] !== undefined && before[k] !== after[k])
+          .map(k => k.split('#')[0]))];
         const expect = letters.split('').sort().join('');
-        const actual = String(got || '').split('').sort().join('');
-        if (actual === expect) { stat.filled++; stat.byType[bucket] = (stat.byType[bucket] || 0) + 1; }
-        else if (!filled) stat.errs.push(`第${examNum}题${sub ? '-' + sub : ''}(${type}) 选项 ${letters} 不存在`);
-        else { stat.filled++; stat.byType[bucket] = (stat.byType[bucket] || 0) + 1; log(`  第${examNum}题${sub ? '-' + sub : ''} 已点 ${filled}（页面无选中标记，以点击为准）`); }
+        const actual = changed.join('').split('').sort().join('');
+        const tag = `第${examNum}题${sub ? '-' + sub : ''}`;
+        if (actual === expect) {
+          stat.filled++; stat.byType[bucket] = (stat.byType[bucket] || 0) + 1;
+        } else if (!filled) {
+          stat.errs.push(`${tag}(${type}) 选项 ${letters} 不存在`);
+        } else if (!changed.length) {
+          // 页面把选中样式放在更远的祖先上，diff 拿不到 —— 点击确实发生了，以点击为准
+          stat.filled++; stat.byType[bucket] = (stat.byType[bucket] || 0) + 1;
+          log(`  ${tag} 已点 ${filled}（DOM 无差异，以点击为准）`);
+        } else if (changed.length > letters.length) {
+          // 整片重渲染 → 所有选项都变，diff 不可信，别误报
+          stat.filled++; stat.byType[bucket] = (stat.byType[bucket] || 0) + 1;
+          log(`  ${tag} 已点 ${filled}（面板重渲染，复核跳过）`);
+        } else {
+          // 有变化但对不上：可能漏点/多点了，记一次告警但不判失败
+          stat.filled++; stat.byType[bucket] = (stat.byType[bucket] || 0) + 1;
+          log(`  ⚠ ${tag} 期望 ${expect}，实际变化 ${actual || '(无)'}（已点 ${filled}，请交卷前抽查）`);
+        }
       } else {
         // ── 填空 / 简答：写 UEditor iframe ──
         const pieces = splitBlanks(raw);

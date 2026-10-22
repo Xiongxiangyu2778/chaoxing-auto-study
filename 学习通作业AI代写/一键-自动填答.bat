@@ -1,7 +1,7 @@
 @echo off
+chcp 65001 >nul
 title 学习通 - 自动填答
 cd /d "%~dp0"
-chcp 65001 >nul
 
 set "PY="
 for /d %%d in ("%~dp0..\*") do if exist "%%d\python\python.exe" set "PY=%%d\python\python.exe"

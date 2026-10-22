@@ -313,7 +313,15 @@ def run_stream(cmd, env=None, cwd=HERE):
     """流式执行子进程并实时回显（这样人工也能看到进度）。"""
     print('$ ' + ' '.join('"%s"' % c if ' ' in str(c) else str(c) for c in cmd), flush=True)
     t0 = time.time()
-    proc = subprocess.Popen(cmd, cwd=cwd, env=env or dict(os.environ),
+    e = dict(os.environ)
+    # 🛠 v7.2（2026-10-22）：子进程（archive_homework.py 等）在 GBK 控制台输出中文，
+    #    这里按 utf-8 解码 → 全乱码 → 「归档完成 -> 路径」正则永远匹配不上 →
+    #    归档明明成功却报 ok:false（实测踩过：returncode=0 但 dest=null）。
+    #    统一强制子进程用 utf-8 输出。
+    e['PYTHONIOENCODING'] = 'utf-8'
+    if env:
+        e.update(env)
+    proc = subprocess.Popen(cmd, cwd=cwd, env=e,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     lines = []
     for raw in proc.stdout:
@@ -545,8 +553,15 @@ def cmd_fill(argv):
 
 
 def exam_mode_active():
-    """最近一次导出是不是考试模式（考试单元.json 比 题目.txt 新或同时生成）。"""
+    """最近一次导出是不是考试模式（考试单元.json 有 units 且比 题目.txt 新或同时生成）。"""
     if not os.path.exists(EXAM_UNITS):
+        return False
+    # v6（2026-10-22）：必须真有 units —— 否则「抓 0 题」的空产物也会被当成有效考试导出
+    try:
+        with open(EXAM_UNITS, encoding='utf-8') as f:
+            if not (json.load(f).get('units') or []):
+                return False
+    except Exception:
         return False
     paper = os.path.join(HERE, '题目.txt')
     if not os.path.exists(paper):
@@ -636,6 +651,7 @@ def cmd_exam(argv):
     course_opt = None
     seq_opt = None
     skip_ai = '--skip-ai' in argv
+    skip_dump = '--skip-dump' in argv   # v6（2026-10-22）：复用现有导出文件，不重新抓题
     no_fill = '--no-fill' in argv
     no_archive = '--no-archive' in argv
     transcript_opt = None
@@ -655,26 +671,38 @@ def cmd_exam(argv):
     t_all = time.time()
 
     # ① 导出（dump 内部自动识别考试页 → 逐题遍历）
-    info('【1/5】导出考试题目（逐题遍历）…')
-    snap = snapshot_files()          # 先备份：进错页面不至于把上次题目/答案冲掉
-    rc = cmd_dump([])
-    if rc != 0:
-        info('✗ 导出失败，终止')
-        restore_files(snap)
-        return rc
-    if not exam_mode_active():
-        info('✗ 当前页面不像考试作答页（没生成 考试单元.json）。')
-        restore_files(snap)
-        info('  （已恢复导出前的 题目.txt / 答案模板.json / answers.json）')
-        info('  请先在浏览器里进入考试（输入验证码后），再重跑：python chx.py exam')
-        emit({'action': 'exam', 'ok': False, 'stage': 'dump',
-              'hint': '需要停在考试作答页（exam-ans/reVersionTestStartNew）'})
-        return 4
+    if skip_dump:
+        info('【1/5】跳过导出（--skip-dump）→ 复用现有 题目.txt / 考试单元.json')
+        if not exam_mode_active():
+            info('✗ 现有导出文件无效（考试单元.json 没有 units）。去掉 --skip-dump 重跑。')
+            emit({'action': 'exam', 'ok': False, 'stage': 'dump',
+                  'hint': '--skip-dump 但现有导出为空'})
+            return 4
+    else:
+        info('【1/5】导出考试题目（逐题遍历）…')
+        snap = snapshot_files()          # 先备份：进错页面不至于把上次题目/答案冲掉
+        rc = cmd_dump([])
+        if rc != 0:
+            info('✗ 导出失败，终止')
+            restore_files(snap)
+            return rc
+        if not exam_mode_active():
+            info('✗ 当前页面不像考试作答页（没生成 考试单元.json）。')
+            restore_files(snap)
+            info('  （已恢复导出前的 题目.txt / 答案模板.json / answers.json）')
+            info('  请先在浏览器里进入考试（输入验证码后），再重跑：python chx.py exam')
+            emit({'action': 'exam', 'ok': False, 'stage': 'dump',
+                  'hint': '需要停在考试作答页（exam-ans/reVersionTestStartNew）'})
+            return 4
     try:
         with open(EXAM_UNITS, encoding='utf-8') as f:
             meta_units = json.load(f)
         n_units = len(meta_units.get('units') or [])
         has_audio = any((u.get('audioOids') or []) for u in (meta_units.get('units') or []))
+        if meta_units.get('partial'):
+            info('⚠ 本次导出是残卷：抓到 %d 题 / 答题卡 %s 题（抓取中途页面失效）'
+                 % (n_units, meta_units.get('cardCount', '?')))
+            info('  答题会照常进行，但交卷前请对照答题卡确认没有漏题')
         info('考试单元：%d 个%s' % (n_units, '（含听力音频）' if has_audio else ''))
     except Exception:
         n_units, has_audio = 0, False
@@ -688,12 +716,8 @@ def cmd_exam(argv):
                 meta = json.load(f)
         except Exception:
             meta = {}
-    course = course_opt or guess_course(meta.get('candidates') or [])
+    course, _src = resolve_course(meta, course_opt, 'exam')
     if not course:
-        info('✗ 没认出课程名。请加 --course "课程名" 重跑；页面候选：%s'
-             % ('、'.join((meta.get('candidates') or [])[:6]) or '无'))
-        emit({'action': 'exam', 'ok': False, 'stage': 'course',
-              'candidates': meta.get('candidates') or [], 'hint': '加 --course "课程名"'})
         return 4
     info('课程判定：%s' % course)
     steps.append('course=' + course)
@@ -817,7 +841,8 @@ def cmd_archive(argv):
     payload = {'action': 'archive', 'ok': rc == 0 and bool(dest), 'returncode': rc,
                'seconds': secs, 'dest': dest}
     if not dest:
-        payload['hint'] = 'rc=1 通常是「题目.txt 不存在」——先运行 chx.py dump。'
+        payload['hint'] = ('rc=0 但没匹配到「归档完成」输出：多半是子进程输出编码问题（已强制 utf-8，重跑应恢复）；'
+                           'rc=1 才是「题目.txt 不存在」——先运行 chx.py dump。')
     emit(payload)
     return 0 if payload['ok'] else (rc or 1)
 
@@ -1012,6 +1037,64 @@ def guess_course(candidates):
     return best if best_score >= 0.55 else None
 
 
+# ── v7（2026-10-22）：courseId → 课程名 缓存 ──────────────────────────────
+# 背景：dowork / 考试页的 DOM 里常常根本没有课程名（标题只有"作业作答"/"考试"），
+# 相似度匹配无从谈起。但 URL 里一定带 courseId —— 它才是课程唯一标识。
+# 第一次用户指定课程名后按 courseId 记住，以后同课程的作业/考试全自动识别。
+COURSE_MAP = os.path.join(HERE, '课程映射.json')
+
+
+def load_course_map():
+    if not os.path.exists(COURSE_MAP):
+        return {}
+    try:
+        with open(COURSE_MAP, encoding='utf-8') as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def save_course_map(m):
+    try:
+        with open(COURSE_MAP, 'w', encoding='utf-8') as f:
+            json.dump(m, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        info('⚠ 课程映射.json 写入失败：%s' % e)
+
+
+def resolve_course(meta, course_opt, action):
+    """课程名四级判定：--course 参数 → 页面候选相似度 → courseId 缓存 → 控制台提问。
+    返回 (course, source)；认不出时 course 为 None。"""
+    course = course_opt or guess_course(meta.get('candidates') or [])
+    if course:
+        return course, ('参数' if course_opt else '页面匹配')
+    cmap = load_course_map()
+    cid = str(meta.get('courseId') or '')
+    if cid and cid in cmap:
+        info('课程判定（courseId %s 缓存）：%s' % (cid, cmap[cid]))
+        return cmap[cid], '缓存'
+    if cid and sys.stdin.isatty():
+        try:
+            info('页面候选：%s' % ('、'.join((meta.get('candidates') or [])[:6]) or '无'))
+            ans = input('【chx】没认出课程名，请输入（直接回车=终止）: ').strip()
+        except (EOFError, KeyboardInterrupt):
+            ans = ''
+        if ans:
+            cmap[cid] = ans
+            if meta.get('classId'):
+                cmap['%s:%s' % (cid, meta['classId'])] = ans
+            save_course_map(cmap)
+            info('已记住：courseId %s → %s（下次同课程自动识别）' % (cid, ans))
+            return ans, '手动输入'
+    if not course:
+        info('✗ 没认出课程名。请加 --course "课程名" 重跑；页面候选：%s'
+             % ('、'.join((meta.get('candidates') or [])[:6]) or '无'))
+        emit({'action': action, 'ok': False, 'stage': 'course',
+              'candidates': meta.get('candidates') or [],
+              'hint': '加 --course "课程名" 指定'})
+    return None, ''
+
+
 def build_prompt(paper, tmpl):
     want = {k: len(tmpl.get(k) or []) for k in ('single', 'judge', 'blank', 'essay')}
     return (
@@ -1020,7 +1103,8 @@ def build_prompt(paper, tmpl):
         '{"single":[%d 项],"judge":[%d 项],"blank":[%d 项],"essay":[%d 项],'
         '"explain":{"题号":"解题思路"}}\n\n'
         '规则：\n'
-        '- single 收单选题与多选题；多选按字母顺序连写，如 "ABC"\n'
+        '- single 收单选题与多选题；**阅读理解/完形填空的子题也算单选题**，连同大题的普通单选一起，按题目编号顺序填入\n'
+        '- 多选按字母顺序连写，如 "ABC"\n'
         '- judge 判断题用 "A"（正确）或 "B"（错误）\n'
         '- blank 填空题填语义答案，多个空用；分隔\n'
         '- essay 简答/计算题写完整作答文本\n'
@@ -1111,13 +1195,8 @@ def cmd_auto(argv):
                 meta = json.load(f)
         except Exception:
             meta = {}
-    course = course_opt or guess_course(meta.get('candidates') or [])
+    course, _src = resolve_course(meta, course_opt, 'auto')
     if not course:
-        info('✗ 没认出课程名。请加 --course "课程名" 重跑；页面候选：%s'
-             % ('、'.join((meta.get('candidates') or [])[:6]) or '无'))
-        emit({'action': 'auto', 'ok': False, 'stage': 'course',
-              'candidates': meta.get('candidates') or [],
-              'hint': '加 --course "课程名" 指定'})
         return 4
     info('课程判定：%s' % course)
     steps.append('course=' + course)

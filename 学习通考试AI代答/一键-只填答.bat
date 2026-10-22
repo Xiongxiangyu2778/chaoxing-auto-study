@@ -1,7 +1,12 @@
 @echo off
+chcp 65001 >nul
 title 学习通 - 只填答（考试页/作业页通用）
 cd /d "%~dp0..\写作业"
-chcp 65001 >nul
+if not exist "chx.py" (
+  echo [错误] 没找到 写作业\chx.py，请确认目录结构完整
+  pause
+  exit /b 1
+)
 
 set "PY="
 for /d %%d in ("%~dp0..\..\*") do if exist "%%d\python\python.exe" set "PY=%%d\python\python.exe"
