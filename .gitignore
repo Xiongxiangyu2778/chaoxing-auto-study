@@ -29,3 +29,25 @@ node_modules/
 Thumbs.db
 __pycache__/
 *.pyc
+
+# ══ 登录态 / 浏览器数据（含 cookie，泄露=账号被盗，绝不入库）══
+edge-profile/
+edge-quiz-profile/
+浏览器数据/
+profile/
+browser-data/
+Cookies
+"Local State"
+Login Data
+*.sqlite
+
+# ══ 本地备份 / 历史（含开发者真实路径）══
+_backup*/
+历史/
+历史版本/
+其他脚本备份/
+
+# ══ 截图（可能含真实姓名/课程/成绩）══
+*.png
+*.jpg
+*.mp4
